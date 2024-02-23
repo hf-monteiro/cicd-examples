@@ -1,0 +1,377 @@
+/*
+This GitLab CI pipeline configures a CI/CD workflow, including build, test, deploy, and promotion across environments, with key features such as:
+
+1. Docker-in-Docker: service** for container operations within CI jobs.
+2. Multi-stage pipeline: for organized workflow from code integration to production deployment.
+3. External services integration: like SonarCloud for code quality checks, AWS for deployments.
+4. Security scans: including SAST, dependency, license, and secret detection to ensure code security.
+5. Version and tag management: for automated versioning and tagging of builds.
+6. Dynamic environment handling: through variables for seamless deployment across dev, QA, staging, and production.
+7. Promotion strategy: to control progression through environments based on defined criteria.
+
+This setup leverages GitLab CI's features for a comprehensive automated workflow from code integration to production.
+
+
+*/
+
+image: ${CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX}/maven:3.8.5-openjdk-17-slim
+# Defines the stages of the pipeline, each serving a specific purpose in the CI/CD process.
+stages:
+  - build
+  - test
+  - mr-deploy # Deploy in dev environment before merging.
+  - regression
+  - tag # Tagging for dev environment.
+  - version # Version management for dev, qa, stage, and prod environments.
+  - publish # Publishing for dev.
+  - deploy # Deployment for dev.
+  - promote # Promotion to qa, stage, and prod environments.
+
+## Docker-in-Docker service setup, crucial for running containers within the CI jobs.
+services:
+  - name: docker:dind
+    alias: docker
+    # explicitly disable tls to avoid docker startup interruption
+    command: ["--tls=false"]
+
+#INCLUDE SECTION
+include:
+# Call SonarCloud template
+  - project: 'exp/pipeline-library'
+    file: 'tests/.sonarcloud.yml'
+
+# Call TestContainers template  
+  - project: 'exp/pipeline-library'
+    file: 'docker-actions/.docker-login.yml'
+
+# Call mr-deploy template
+  - project: 'exp/pipeline-library'
+    file: 'aws-actions/.mr-deploy.yml'
+
+# Call security scans
+  - template: Jobs/SAST.latest.gitlab-ci.yml
+  - template: Jobs/Dependency-Scanning.gitlab-ci.yml
+  - template: Jobs/License-Scanning.gitlab-ci.yml
+  - template: Jobs/Secret-Detection.gitlab-ci.yml
+  
+variables:
+  SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"  # Defines the location of the analysis task cache
+  SONAR_PROJECT: "project-key-value"
+  DOCKER_HOST: "tcp://docker:2375"
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: ""
+  GIT_DEPTH: "0"  # Tells git to fetch all the branches of the project, required by the analysis task
+  MAVEN_OPTS: "-Dmaven.repo.local=$CI_PROJECT_DIR/.m2/REPO"
+  MICRO_NAME: "exp-app-name"
+  VERSION_NUMBER: $CI_COMMIT_TAG
+
+# Build also runs unit tests
+build:
+  stage: build
+  only:
+    - /^.*-dev$/
+    - branches
+    - merge_requests
+  except:
+    - main
+  script:
+    - echo "Building JAR + running tests"
+    - mvn clean package test -B -s ci_settings.xml
+    - echo "Build and Unit Tests completed"
+  artifacts:
+    expire_in: 1 hour
+    name: target
+    paths:
+      - target
+
+# Sonar check will run all tests (unit + integration)
+sonarcloud-check:
+  stage: test
+  only:
+    - merge_requests
+  extends:  
+    - .sonarcloud
+
+# Trigger to call the E2E test downstream pipeline
+end-to-end-test:
+  stage: regression
+  needs:
+    - job: mr-deploy-dev
+      optional: true
+  only:
+    - merge_requests
+  trigger:
+    project: 'exp/large-tests-repo/e2e-tests'
+    strategy: depend
+
+# Trigger to call sencondary test downstream pipeline
+rest-assured:
+  stage: regression
+  needs:
+    - job: mr-deploy-dev
+      optional: true
+  only:
+    - merge_requests
+  trigger:
+    project: 'exp/large-tests-repo/another-test'
+    strategy: depend
+
+# Handles the version tagging for the main branch, incrementing the minor version.
+tag-dev:
+  stage: tag
+  image: ${CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX}/alpine:3.17
+  only:
+    - main
+  before_script:
+    - apk add git maven
+    - git config user.email "${GITLAB_USER_EMAIL}"
+    - git config user.name "${GITLAB_USER_NAME}"
+    - git remote remove origin-token || true
+    - git remote add origin-token https://${GITLAB_TOKEN_NAME}:${GITLAB_ACCESS_TOKEN}@gitlab.com/${CI_PROJECT_PATH}
+  script:
+    - echo "Update application version"
+    - mvn -q -B build-helper:parse-version versions:set -DnewVersion=\${parsedVersion.majorVersion}.\${parsedVersion.nextMinorVersion}.0
+    - APP_NEXT_VERSION=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
+    - git add pom.xml
+    - git commit -m "Version ${APP_NEXT_VERSION}"
+    - git push -o ci.skip origin-token HEAD:$CI_COMMIT_REF_NAME
+    - git tag -a "${APP_NEXT_VERSION}-dev" -m "Version $APP_NEXT_VERSION"
+    - git push origin-token "${APP_NEXT_VERSION}-dev"
+
+# Extracts the version from the tag for use in deployments.
+version:
+  stage: version
+  image: ${CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX}/alpine:3.17
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^([0-9]+.[0-9]+.[0-9]+)(-\w.+)/
+  script:
+    - echo "Extract version from TAG ${CI_COMMIT_TAG}"
+    - TAG_VERSION=$(echo $CI_COMMIT_TAG | sed -E "s/^([0-9]+.[0-9]+.[0-9]+)(-\w.+)/\1/")
+    - echo "Version ${TAG_VERSION}"
+    - echo "APP_VERSION=${TAG_VERSION}" > version.env
+  artifacts:
+    reports:
+      dotenv: version.env
+
+# Pre-merge deployment job for the dev environment, utilizing AWS ECS for service management.
+mr-deploy-dev:
+  stage: mr-deploy
+  only:
+    - merge_requests
+  services:
+    - docker:24-dind
+  variables:
+    AWS_ECS_CLUSTER: exp-dev-cluster
+    AWS_ECS_SERVICE_APP: exp-app-dev
+    AWS_ECS_SERVICE_WEB: exp-web-dev
+  extends: 
+    - .mr-deploy-dev
+  before_script:
+    - amazon-linux-extras install docker
+    - aws --version
+    - docker --version
+    - export COMMIT_app=$(date +"%Y%m%d")  
+    - export AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID_DEV
+    - export AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY_DEV
+    - export AWS_DEFAULT_REGION=$AWS_DEFAULT_REGION
+    - aws ecs update-service --cluster $AWS_ECS_CLUSTER --service $AWS_ECS_SERVICE_WEB --force-new-deployment
+
+# Builds and publishes Docker images to an AWS ECR repository for the dev environment.
+publish-dev:
+  stage: publish
+  only:
+    - /^([0-9]+(\.[0-9]+)+)-dev/i
+  image:
+    name: ${CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX}/amazon/aws-cli:2.1.38
+    entrypoint: [ "" ]
+  services:
+    - docker:24-dind
+  before_script:
+    - amazon-linux-extras install docker
+    - aws --version
+    - docker --version
+  script:
+    - echo "Starting building docker image from tag $CI_COMMIT_TAG"
+    - echo $ECR_REPO_ADDRESS_DEV/$REPO_NAME_DEV:$APP_VERSION
+    - export AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID_DEV
+    - export AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY_DEV
+    - export AWS_DEFAULT_REGION=$AWS_DEFAULT_REGION
+    - echo $ECR_REPO_ADDRESS_DEV
+    - docker build -t $ECR_REPO_ADDRESS_DEV/$REPO_NAME_DEV:$CI_COMMIT_SHORT_SHA -f Dockerfile --build-arg APP_VERSION=$APP_VERSION .
+    - echo "Completed building docker image"
+    - echo "Started publishing docker image"
+    - aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin $ECR_REPO_ADDRESS_DEV
+    - docker images
+    - docker push $ECR_REPO_ADDRESS_DEV/$REPO_NAME_DEV:$CI_COMMIT_SHORT_SHA
+
+# Deploys the application to the dev environment, including service updates in AWS ECS.
+deploy-dev:
+  stage: deploy
+  environment:
+    name: dev
+  only:
+    - /([0-9]+(\.[0-9]+)+)-dev/i
+  variables:
+    AWS_ECS_CLUSTER: exp-dev-cluster
+    AWS_ECS_SERVICE_APP: exp-app-dev
+    AWS_ECS_SERVICE_WEB: exp-web-dev
+  image:
+    name: ${CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX}/amazon/aws-cli:2.1.38
+    entrypoint: [ "" ]
+  services:
+    - docker:dind
+  before_script:
+    - amazon-linux-extras install docker
+    - aws --version
+    - docker --version
+  script:
+    - echo "Starting to deploy docker image $ECR_REPO_ADDRESS_DEV/$REPO_NAME_DEV:$APP_VERSION from tag $CI_COMMIT_TAG"
+    - echo $ECR_REPO_ADDRESS_DEV/$REPO_NAME_DEV:$APP_VERSION
+    - export AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID_DEV
+    - export AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY_DEV
+    - export AWS_DEFAULT_REGION=$AWS_DEFAULT_REGION
+    - aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin $ECR_REPO_ADDRESS_DEV
+    - docker pull $ECR_REPO_ADDRESS_DEV/$REPO_NAME_DEV:$CI_COMMIT_SHORT_SHA
+
+    - docker tag $ECR_REPO_ADDRESS_DEV/$REPO_NAME_DEV:$CI_COMMIT_SHORT_SHA $ECR_REPO_ADDRESS_DEV/$REPO_NAME_DEV:$APP_VERSION
+    - docker tag $ECR_REPO_ADDRESS_DEV/$REPO_NAME_DEV:$CI_COMMIT_SHORT_SHA $ECR_REPO_ADDRESS_DEV/$REPO_NAME_DEV:latest
+
+    - docker push $ECR_REPO_ADDRESS_DEV/$REPO_NAME_DEV:$APP_VERSION
+    - docker push $ECR_REPO_ADDRESS_DEV/$REPO_NAME_DEV:latest
+
+    - aws ecs update-service --cluster $AWS_ECS_CLUSTER --service $AWS_ECS_SERVICE_APP --force-new-deployment
+    - aws ecs update-service --cluster $AWS_ECS_CLUSTER --service $AWS_ECS_SERVICE_WEB --force-new-deployment
+
+# Promotion jobs for pushing the application through QA.
+promote-qa:
+  stage: promote
+  environment:
+    name: qa  
+  only:
+    - /([0-9]+(\.[0-9]+)+)-qa/i
+  variables:
+    AWS_ECS_CLUSTER: exp-qa-cluster
+    AWS_ECS_SERVICE_APP: exp-app-qa
+    AWS_ECS_SERVICE_WEB: exp-web-qa
+  image:
+    name: ${CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX}/amazon/aws-cli:2.1.38
+    entrypoint: [ "" ]
+  services:
+    - docker:24-dind
+  before_script:
+    - amazon-linux-extras install docker
+    - aws --version
+    - docker --version
+  script:
+    - echo "Promoting $ECR_REPO_ADDRESS_DEV/$REPO_NAME:$APP_VERSION from tag $CI_COMMIT_TAG to QA"
+    - export AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID_DEV
+    - export AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY_DEV
+    - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $ECR_REPO_ADDRESS_DEV
+    - docker pull $ECR_REPO_ADDRESS_DEV/$REPO_NAME_DEV:$CI_COMMIT_SHORT_SHA
+    - export AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID_STAGE
+    - export AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY_STAGE
+    - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $ECR_REPO_ADDRESS_QA
+
+    - docker tag $ECR_REPO_ADDRESS_DEV/$REPO_NAME_DEV:$CI_COMMIT_SHORT_SHA $ECR_REPO_ADDRESS_QA/$REPO_NAME_QA:$CI_COMMIT_SHORT_SHA
+    - docker tag $ECR_REPO_ADDRESS_QA/$REPO_NAME_QA:$CI_COMMIT_SHORT_SHA $ECR_REPO_ADDRESS_QA/$REPO_NAME_QA:$APP_VERSION
+    - docker tag $ECR_REPO_ADDRESS_QA/$REPO_NAME_QA:$CI_COMMIT_SHORT_SHA $ECR_REPO_ADDRESS_QA/$REPO_NAME_QA:latest
+
+    - docker push $ECR_REPO_ADDRESS_QA/$REPO_NAME_QA:$CI_COMMIT_SHORT_SHA
+    - docker push $ECR_REPO_ADDRESS_QA/$REPO_NAME_QA:$APP_VERSION
+    - docker push $ECR_REPO_ADDRESS_QA/$REPO_NAME_QA:latest
+
+    - aws ecs update-service --cluster $AWS_ECS_CLUSTER --service $AWS_ECS_SERVICE_APP --force-new-deployment
+    - aws ecs update-service --cluster $AWS_ECS_CLUSTER --service $AWS_ECS_SERVICE_WEB --force-new-deployment
+
+# Integration with Jira for updating tickets based on deployments to specific environments.
+update-jira:
+  stage: promote
+  trigger:
+    project: 'exp/tools/release-utilities'
+    branch: main
+  variables:
+    FUNCTION: "PROMOTE_TO_ENV"
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^\d+\.\d+\.\d+-(stage|prod)$/
+
+# Promotion jobs for pushing the application through STAGE.
+promote-stage:
+  stage: promote
+  environment:
+    name: stage  
+  only:
+    - /([0-9]+(\.[0-9]+)+)-stage/i
+  variables:
+    AWS_ECS_CLUSTER: exp-stage-cluster
+    AWS_ECS_SERVICE_APP: exp-app-stage
+    AWS_ECS_SERVICE_WEB: exp-web-stage
+  image:
+    name: ${CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX}/amazon/aws-cli:2.1.38
+    entrypoint: [ "" ]
+  services:
+    - docker:24-dind
+  before_script:
+    - amazon-linux-extras install docker
+    - aws --version
+    - docker --version
+  script:
+    - echo "Promoting $ECR_REPO_ADDRESS_DEV/$REPO_NAME:$APP_VERSION from tag $CI_COMMIT_TAG to STAGE"
+    - export AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID_DEV
+    - export AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY_DEV
+    - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $ECR_REPO_ADDRESS_DEV
+    - docker pull $ECR_REPO_ADDRESS_DEV/$REPO_NAME_DEV:$CI_COMMIT_SHORT_SHA
+    - export AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID_STAGE
+    - export AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY_STAGE
+    - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $ECR_REPO_ADDRESS_STAGE
+
+    - docker tag $ECR_REPO_ADDRESS_DEV/$REPO_NAME_DEV:$CI_COMMIT_SHORT_SHA $ECR_REPO_ADDRESS_STAGE/$REPO_NAME_STAGE:$CI_COMMIT_SHORT_SHA
+    - docker tag $ECR_REPO_ADDRESS_STAGE/$REPO_NAME_STAGE:$CI_COMMIT_SHORT_SHA $ECR_REPO_ADDRESS_STAGE/$REPO_NAME_STAGE:$APP_VERSION
+    - docker tag $ECR_REPO_ADDRESS_STAGE/$REPO_NAME_STAGE:$CI_COMMIT_SHORT_SHA $ECR_REPO_ADDRESS_STAGE/$REPO_NAME_STAGE:latest
+
+    - docker push $ECR_REPO_ADDRESS_STAGE/$REPO_NAME_STAGE:$CI_COMMIT_SHORT_SHA
+    - docker push $ECR_REPO_ADDRESS_STAGE/$REPO_NAME_STAGE:$APP_VERSION
+    - docker push $ECR_REPO_ADDRESS_STAGE/$REPO_NAME_STAGE:latest
+
+    - aws ecs update-service --cluster $AWS_ECS_CLUSTER --service $AWS_ECS_SERVICE_APP --force-new-deployment
+    - aws ecs update-service --cluster $AWS_ECS_CLUSTER --service $AWS_ECS_SERVICE_WEB --force-new-deployment
+
+# Promotion jobs for pushing the application through PROD.
+promote-prod:
+  stage: promote
+  environment:
+    name: prod
+  only:
+    - /([0-9]+(\.[0-9]+)+)-prod/i
+  variables:
+    AWS_ECS_CLUSTER: exp-prod-cluster
+    AWS_ECS_SERVICE_APP: exp-app-prod
+    AWS_ECS_SERVICE_WEB: exp-web-prod
+  image:
+    name: ${CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX}/amazon/aws-cli:2.1.38
+    entrypoint: [ "" ]
+  services:
+    - docker:18.09.7-dind
+  before_script:
+    - amazon-linux-extras install docker
+    - aws --version
+    - docker --version
+  script:
+    - echo "Promoting $ECR_REPO_ADDRESS_STAGE/$REPO_NAME_STAGE:$APP_VERSION from tag $CI_COMMIT_TAG to PROD"
+    - export AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID_STAGE
+    - export AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY_STAGE
+    - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $ECR_REPO_ADDRESS_STAGE
+    - docker pull $ECR_REPO_ADDRESS_STAGE/$REPO_NAME_STAGE:$CI_COMMIT_SHORT_SHA
+    - export AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID_PROD
+    - export AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY_PROD
+    - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $ECR_REPO_ADDRESS_PROD
+
+    - docker tag $ECR_REPO_ADDRESS_STAGE/$REPO_NAME_STAGE:$CI_COMMIT_SHORT_SHA $ECR_REPO_ADDRESS_PROD/$REPO_NAME_PROD:$CI_COMMIT_SHORT_SHA
+    - docker tag $ECR_REPO_ADDRESS_PROD/$REPO_NAME_PROD:$CI_COMMIT_SHORT_SHA $ECR_REPO_ADDRESS_PROD/$REPO_NAME_PROD:$APP_VERSION
+    - docker tag $ECR_REPO_ADDRESS_PROD/$REPO_NAME_PROD:$CI_COMMIT_SHORT_SHA $ECR_REPO_ADDRESS_PROD/$REPO_NAME_PROD:latest
+
+    - docker push $ECR_REPO_ADDRESS_PROD/$REPO_NAME_PROD:$CI_COMMIT_SHORT_SHA
+    - docker push $ECR_REPO_ADDRESS_PROD/$REPO_NAME_PROD:$APP_VERSION
+    - docker push $ECR_REPO_ADDRESS_PROD/$REPO_NAME_PROD:latest
+
+    - aws ecs update-service --cluster $AWS_ECS_CLUSTER --service $AWS_ECS_SERVICE_APP --force-new-deployment
+    - aws ecs update-service --cluster $AWS_ECS_CLUSTER --service $AWS_ECS_SERVICE_WEB --force-new-deployment
