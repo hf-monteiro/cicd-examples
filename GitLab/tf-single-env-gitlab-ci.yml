@@ -1,0 +1,161 @@
+#tf repository pipeline example 
+/*
+This GitLab CI/CD pipeline automates Terraform workflows for a simple development environment. It includes:
+1. Prepare: Initializes Terraform with necessary backends and plugins.
+2. Validate: Ensures Terraform configurations are error-free and generates execution plans.
+3. Build: Creates environment-specific Terraform plans for targeted deployments.
+4. Deploy: Applies Terraform plans manually to control infrastructure changes.
+
+The pipeline uses conditional execution, manual triggers, and variables for dynamic configuration, ensuring precise infrastructure management.
+*/
+
+# Use the latest stable Terraform image from GitLab's container registry as the base image for all jobs.
+image: registry.gitlab.com/gitlab-org/terraform-images/stable:latest
+
+stages:
+  - validate
+  - plan
+  - applyDev
+
+variables:
+  TERRAFORM_DIR: "."
+  TERRAFORM_PLAN_FILE: "planout"
+
+# Define a global before script that will run before each job starts.
+.before_script_global: &before-script-global
+  - terraform --version # Print the Terraform version for debugging purposes.
+  - echo "Terraform dir is ${TERRAFORM_DIR}" # Echo the Terraform directory for debugging.
+  - cd "${TERRAFOM_DIR}" # Change to the Terraform directory. There's a typo here; it should be `${TERRAFORM_DIR}`.
+  - ls # List the contents of the Terraform directory for debugging.
+
+before_script:
+  - *before-script-global
+
+# Template for the validate stage.
+.validate_template: &validate-script
+  script:
+    - rm -rf .terraform # Remove any existing Terraform initialization to ensure a clean state.
+    - echo "${CI_JOB_STAGE} - ${CI_JOB_NAME}" # Echo the current job stage and name for debugging.
+    - terraform validate ${TERRAFORM_DIR}/ # Validate the Terraform files.
+
+# Template for the plan stage.
+.plan_template: &plan-script
+  script:
+    - mkdir -p ~/.ssh && chmod 700 ~/.ssh # Setup SSH directory and permissions for secure communication.
+    - ssh-keyscan -H gitlab.com >> ~/.ssh/known_hosts # Add GitLab.com to known hosts for SSH.
+    - chmod 400 deploykey # Set the appropriate permissions for the deploy key.
+    - eval $(ssh-agent -s) # Start the SSH agent in the background.
+    - ssh-add deploykey # Add the deploy key to the agent.
+    - echo "Terraform DIR VARIABLE ${TERRAFORM_DIR}" # Echo the Terraform directory for debugging.
+    - aws sts get-caller-identity # Verify AWS credentials.
+    - terraform init --backend-config=${CI_ENVIRONMENT_NAME}.s3.texpackend # Initialize Terraform with the specific backend configuration.
+    - echo "Creating plan file for environment ${CI_ENVIRONMENT_NAME}" # Echo the environment for which the plan is being created.
+    - terraform plan ${TF_ADDITIONAL_OPTS} -var-file ${CI_ENVIRONMENT_NAME}.tfvars -out=${TERRAFORM_PLAN_FILE} # Create the Terraform plan.
+  artifacts:
+    paths:
+      - ${TERRAFORM_DIR}/.terraform
+      - ${TERRAFORM_DIR}/${TERRAFORM_PLAN_FILE}
+      - ${TERRAFORM_DIR}/.terraform.lock.hcl # Store Terraform lock file as an artifact.
+
+# Template for apply stages.
+.apply_template: &apply-script
+  script:
+    - mkdir -p ~/.ssh && chmod 700 ~/.ssh # Setup SSH directory and permissions.
+    - ssh-keyscan -H gitlab.com >> ~/.ssh/known_hosts # Add GitLab.com to known hosts.
+    - chmod 400 deploykey # Set the deploy key permissions.
+    - eval $(ssh-agent -s) # Start the SSH agent.
+    - ssh-add deploykey # Add the deploy key.
+    - echo "ENVIRONMENT=${CI_ENVIRONMENT_NAME}" # Echo the environment being applied to.
+    - terraform apply --auto-approve ${TERRAFORM_DIR}/${TERRAFORM_PLAN_FILE} # Apply the Terraform plan without manual approval.
+
+# Job definition for the validate stage in merge requests.
+mr:validate:
+  stage: validate
+  rules:
+    - if: $CI_MERGE_REQUEST_ID # Only run this job if it's part of a merge request.
+  <<: *validate-script # Use the validate script template.
+  environment:
+    name: dev
+
+# Define a job for merge request planning in development environment
+mr:plan-dev:
+  stage: plan
+  rules:  
+    - if: $CI_MERGE_REQUEST_ID  # The job runs only if there's a merge request ID
+  id_tokens:  
+    GITLAB_OIDC_TOKEN:  # Configuration for OpenID Connect token used for authentication
+      aud: https://gitlab.com
+  before_script:  # Commands to run before the main script
+    - apk --no-cache add jq  # Install jq for JSON processing
+    - alias convert_report="jq -r '([.resource_changes[]?.change.actions?]|flatten)|{\"create\":(map(select(.==\"create\"))|length),\"update\":(map(select(.==\"update\"))|length),\"delete\":(map(select(.==\"delete\"))|length)}'"
+    - apk --no-cache add python3 py3-pip
+    - pip3 install --upgrade pip && pip3 install --no-cache-dir awscli
+    - >
+      export $(printf "AWS_ACCESS_KEY_ID=%s AWS_SECRET_ACCESS_KEY=%s AWS_SESSION_TOKEN=%s"
+      $(aws sts assume-role-with-web-identity
+      --role-arn arn:aws:iam::ACC-EXAMPLE:role/terraform
+      --role-session-name "GitLabRunner-${CI_PROJECT_ID}-${CI_PIPELINE_ID}"
+      --web-identity-token ${GITLAB_OIDC_TOKEN}
+      --duration-seconds 3600
+      --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]'
+      --output text))
+    - aws sts get-caller-identity
+  <<: *plan-script
+  after_script:
+    - terraform show --json ${TERRAFORM_PLAN_FILE} | convert_report > $PLAN_JSON
+  artifacts:
+    reports:
+      terraform: $PLAN_JSON
+  environment:
+    name: dev
+
+# Define a job for planning in the development environment on the main branch
+plan-dev:
+  stage: plan  # Assigns the job to the 'plan' stage
+  only:
+    - main  # Restricts the job to only run on the main branch
+  id_tokens:
+    GITLAB_OIDC_TOKEN:
+      aud: https://gitlab.com
+  before_script:
+    - apk --no-cache add python3 py3-pip
+    - pip3 install --upgrade pip && pip3 install --no-cache-dir awscli
+    - >
+      export $(printf "AWS_ACCESS_KEY_ID=%s AWS_SECRET_ACCESS_KEY=%s AWS_SESSION_TOKEN=%s"
+      $(aws sts assume-role-with-web-identity
+      --role-arn arn:aws:iam::ACC-EXAMPLE:role/terraform
+      --role-session-name "GitLabRunner-${CI_PROJECT_ID}-${CI_PIPELINE_ID}"
+      --web-identity-token ${GITLAB_OIDC_TOKEN}
+      --duration-seconds 3600
+      --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]'
+      --output text))
+    - aws sts get-caller-identity
+  <<: *plan-script
+  environment:
+    name: dev
+
+# Define a manual job for applying the Terraform plan in the development environment
+apply-dev:
+  stage: applyDev
+  only:
+    - main
+  when: manual
+  id_tokens:
+    GITLAB_OIDC_TOKEN:
+      aud: https://gitlab.com
+  before_script:
+    - apk --no-cache add python3 py3-pip
+    - pip3 install --upgrade pip && pip3 install --no-cache-dir awscli
+    - >
+      export $(printf "AWS_ACCESS_KEY_ID=%s AWS_SECRET_ACCESS_KEY=%s AWS_SESSION_TOKEN=%s"
+      $(aws sts assume-role-with-web-identity
+      --role-arn arn:aws:iam::ACC-EXAMPLE:role/terraform
+      --role-session-name "GitLabRunner-${CI_PROJECT_ID}-${CI_PIPELINE_ID}"
+      --web-identity-token ${GITLAB_OIDC_TOKEN}
+      --duration-seconds 3600
+      --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]'
+      --output text))
+    - aws sts get-caller-identity
+  <<: *apply-script
+  environment:
+    name: dev
