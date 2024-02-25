@@ -11,13 +11,13 @@ To use these examples, you'll need a GitLab account and a project where you can 
 Below is a brief overview of each example included in this repository. For more detailed information, please refer to the specific configuration files and their comments.
 
 - **tf complete pipeline**: pipeline automates Terraform workflows across development, staging, QA, and production environments.
-  - [GitLab/tf-gitlab-ci.yml](GitLab/tf-complete-gitlab-ci.yml)
+  - [GitLab/tf-gitlab-ci.yml](tf-complete-gitlab-ci.yml)
 - **multi-env pipeline**: pipeline configures a CI/CD workflow, including build, test, deploy, and promotion across environments.
-  - [GitLab/multi-env-gitlab-ci.yml](GitLab/multi-env-gitlab-ci.yml)
+  - [GitLab/multi-env-gitlab-ci.yml](multi-env-gitlab-ci.yml)
 - **multi-build pipeline**: pipeline configures a CI/CD workflow, with multiple build/publish/deploy steps, for each environment.
-  - [GitLab/multi-build-gitlab-ci.yml](GitLab/multi-build-gitlab-ci.yml)
+  - [GitLab/multi-build-gitlab-ci.yml](multi-build-gitlab-ci.yml)
 - **tf single env pipeline**: pipeline automates Terraform workflows for a single environment.
-  - [GitLab/tf-eks-gitlab-ci.yml](GitLab/tf-single-env-gitlab-ci.yml)
+  - [GitLab/tf-single-env-gitlab-ci.yml](tf-single-env-gitlab-ci.yml)
 
 
 ## How to Use
