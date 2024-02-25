@@ -1,0 +1,198 @@
+#tf repository pipeline example 
+/*
+This GitLab CI/CD pipeline automates Terraform workflows across development, staging, QA, and production environments. It includes:
+1. Prepare: Initializes Terraform with necessary backends and plugins.
+2. Validate: Ensures Terraform configurations are error-free and generates execution plans.
+3. Build: Creates environment-specific Terraform plans for targeted deployments.
+4. Deploy: Applies Terraform plans manually to control infrastructure changes.
+
+The pipeline uses conditional execution, manual triggers, and variables for dynamic configuration, ensuring precise infrastructure management.
+*/
+
+image: registry.gitlab.com/gitlab-org/terraform-images/stable:latest
+
+# Cache configuration to speed up job execution
+cache:
+  key: dev
+  paths: # Cache the .terraform directory to reuse between jobs
+    - ${TF_ROOT}/.terraform
+
+before_script:
+  - cd ${TF_ROOT}
+
+stages:
+  - prepare # Stage for initializing Terraform
+  - validate # Stage for validating Terraform files
+  - build # Stage for creating Terraform plans
+  - deploy # Stage for applying Terraform changes
+
+init:
+  stage: prepare
+  script:
+    - gitlab-terraform init # Initializes Terraform, getting it ready for execution
+
+# Job to validate Terraform configurations
+validate:
+  stage: validate
+  variables:
+    TF_ROOT: ${CI_PROJECT_DIR}/new_envs/dev
+    TF_ADDRESS: ${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/terraform/state/dev-state # tells GitLab to access the Terraform state file named dev-state
+    TF_ACCESS_ID: ${AWS_KEY_ID_DEV}
+    TF_SECRET_KEY: ${AWS_SECRET_KEY_DEV}
+  script:
+    - gitlab-terraform validate # Validate the syntax of Terraform files
+    - gitlab-terraform plan # Show what Terraform thinks it will do
+
+# Job to create Terraform plan for the 'dev' environment   
+plan-dev:
+  rules: # Conditional to run this job only for MRs targeting master or commits on master
+    - if: ($CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "master") || $CI_COMMIT_BRANCH == "master"
+  stage: build
+  variables:
+    TF_ROOT: ${CI_PROJECT_DIR}/new_envs/dev
+    TF_ADDRESS: ${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/terraform/state/dev-state # tells GitLab to access the Terraform state file named dev-state
+    TF_ACCESS_ID: ${AWS_KEY_ID_DEV}
+    TF_SECRET_KEY: ${AWS_SECRET_KEY_DEV}
+  script:
+    - gitlab-terraform plan
+    - gitlab-terraform plan-json
+  artifacts: # Save the plan as an artifact
+    name: plan
+    paths:
+      - ${TF_ROOT}/plan.cache
+    reports:
+      terraform: ${TF_ROOT}/plan.json
+
+# Job to apply the 'dev' environment plan
+apply-dev:
+  stage: deploy
+  rules: # Conditional to allow manual trigger for approved MRs to master or commits on master
+    - if: ($CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "master" && $CI_MERGE_REQUEST_APPROVED) || $CI_COMMIT_BRANCH == "master"
+  when: manual # Require manual action to apply
+  variables:
+    TF_ROOT: ${CI_PROJECT_DIR}/new_envs/dev
+    TF_ADDRESS: ${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/terraform/state/dev-state # tells GitLab to access the Terraform state file named dev-state
+    TF_ACCESS_ID: ${AWS_KEY_ID_DEV}
+    TF_SECRET_KEY: ${AWS_SECRET_KEY_DEV}
+  environment: # Define the deployment environment
+    name: dev
+  script:
+    - gitlab-terraform apply
+  dependencies: # Ensure this job runs only after the plan-dev job
+    - plan-dev
+
+# Job to create Terraform plan for the 'stage' environment 
+plan-stage:
+  rules: # Conditional to run this job only for MRs targeting stage or commits on stage
+    - if: ($CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "stage") || $CI_COMMIT_BRANCH == "stage"
+  stage: build
+  variables:
+    TF_ROOT: ${CI_PROJECT_DIR}/new_envs/dev
+    TF_ADDRESS: ${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/terraform/state/stage-state # tells GitLab to access the Terraform state file named stage-state
+    TF_ACCESS_ID: ${AWS_KEY_ID_STAGE}
+    TF_SECRET_KEY: ${AWS_SECRET_KEY_STAGE}
+  script:
+    - gitlab-terraform plan
+    - gitlab-terraform plan-json
+  artifacts: # Save the plan as an artifact
+    name: plan
+    paths:
+      - ${TF_ROOT}/plan.cache
+    reports:
+      terraform: $${TF_ROOT}/plan.json
+
+# Job to apply the 'stage' environment plan
+apply-stage:
+  rules: # Conditional to allow manual trigger for approved MRs to stage or commits on stage
+    - if: ($CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME  == "stage" && $CI_MERGE_REQUEST_APPROVED) || $CI_COMMIT_BRANCH == "stage"
+      when: manual # Require manual action to apply
+  stage: deploy
+  variables:
+    TF_ROOT: ${CI_PROJECT_DIR}/new_envs/dev
+    TF_ADDRESS: ${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/terraform/state/stage-state # tells GitLab to access the Terraform state file named stage-state
+    TF_ACCESS_ID: ${AWS_KEY_ID_STAGE}
+    TF_SECRET_KEY: ${AWS_SECRET_KEY_STAGE}
+  environment: # Define the deployment environment
+    name: stage
+  script:
+    - gitlab-terraform apply
+  dependencies:  # Ensure this job runs only after the plan-stage job
+    - plan-stage
+
+# Job to create Terraform plan for the 'qa' environment 
+plan-qa:
+  rules: # Conditional to run this job only for MRs targeting qa or commits on qa
+    - if: ($CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "qa") || $CI_COMMIT_BRANCH == "qa"
+  stage: build
+  variables:
+    TF_ROOT: ${CI_PROJECT_DIR}/new_envs/dev
+    TF_ADDRESS: ${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/terraform/state/qa-state # tells GitLab to access the Terraform state file named qa-state
+    TF_ACCESS_ID: ${AWS_KEY_ID_QA}
+    TF_SECRET_KEY: ${AWS_SECRET_KEY_QA}
+  script:
+    - gitlab-terraform plan
+    - gitlab-terraform plan-json
+  artifacts: # Save the plan as an artifact
+    name: plan
+    paths:
+      - ${TF_ROOT}/plan.cache
+    reports:
+      terraform: $${TF_ROOT}/plan.json
+
+# Job to apply the 'qa' environment plan
+apply-qa:
+  rules: # Conditional to allow manual trigger for approved MRs to qa or commits on qa
+    - if: ($CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME  == "qa" && $CI_MERGE_REQUEST_APPROVED) || $CI_COMMIT_BRANCH == "qa"
+      when: manual # Require manual action to apply
+  stage: deploy
+  variables:
+    TF_ROOT: ${CI_PROJECT_DIR}/new_envs/dev
+    TF_ADDRESS: ${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/terraform/state/qa-state # tells GitLab to access the Terraform state file named qa-state
+    TF_ACCESS_ID: ${AWS_KEY_ID_QA}
+    TF_SECRET_KEY: ${AWS_SECRET_KEY_QA}
+  environment: # Define the deployment environment
+    name: qa
+  script:
+    - gitlab-terraform apply
+  dependencies:  # Ensure this job runs only after the plan-qa job
+    - plan-qa
+
+# Job to create Terraform plan for the 'prod' environment 
+plan-prod:
+  rules: # Conditional to run this job only for MRs targeting prod or commits on prod
+    - if: ($CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "prod") || $CI_COMMIT_BRANCH == "prod"
+  stage: build
+  variables:
+    TF_ROOT: ${CI_PROJECT_DIR}/new_envs/dev
+    TF_ADDRESS: ${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/terraform/state/prod-state # tells GitLab to access the Terraform state file named prod-state
+    TF_ACCESS_ID: ${AWS_KEY_ID_PROD}
+    TF_SECRET_KEY: ${AWS_SECRET_KEY_PROD}
+  environment:
+    name: prod
+  script:
+    - gitlab-terraform plan
+    - gitlab-terraform plan-json
+  artifacts: # Save the plan as an artifact
+    name: plan
+    paths:
+      - ${TF_ROOT}/plan.cache
+    reports:
+      terraform: ${TF_ROOT}/plan.json
+
+# Job to apply the 'prod' environment plan
+apply-prod:
+  rules: # Conditional to allow manual trigger for approved MRs to prod or commits on prod
+    - if: ($CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME  == "prod" && $CI_MERGE_REQUEST_APPROVED) || $CI_COMMIT_BRANCH == "prod"
+      when: manual # Require manual action to apply
+  stage: deploy
+  variables:
+    TF_ROOT: ${CI_PROJECT_DIR}/new_envs/dev
+    TF_ADDRESS: ${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/terraform/state/prod-state # tells GitLab to access the Terraform state file named prod-state
+    TF_ACCESS_ID: ${AWS_KEY_ID_PROD}
+    TF_SECRET_KEY: ${AWS_SECRET_KEY_PROD}
+  environment: # Define the deployment environment
+    name: prod
+  script:
+    - gitlab-terraform apply
+  dependencies:  # Ensure this job runs only after the plan-prod job
+    - plan-prod
