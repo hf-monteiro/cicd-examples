@@ -1,26 +1,59 @@
-# Example Pipelines for Git Providers
+# GitLab CI/CD Pipeline Examples
 
-This repository hosts a collection of CI/CD pipeline examples for various Git hosting services including GitHub, GitLab, Bitbucket, and others. These examples are designed to help developers automate their development workflows, from simple code linting to complex deployment strategies.
+Pipeline examples for single-environment and multi-environment GitLab CI/CD workflows, Terraform automation, and reusable delivery patterns.
 
-## Contents
+## Architecture
 
-- `GitHub/` - Contains examples of GitHub Actions workflows for different languages and frameworks.
-- `GitLab/` - Includes GitLab CI/CD pipeline configurations for various use cases.
-- `Bitbucket/` - Bitbucket Pipelines examples for continuous integration and delivery.
-- `Others/` - Pipelines for other Git providers or less common scenarios.
+```mermaid
+flowchart LR
+    subgraph "Multi-Environment Pipeline (multi-env-gitlab-ci.yml)"
+        B["build\nCompile + Unit Tests"]
+        T["test\nSonarCloud · SAST\nDependency Scan"]
+        MR["mr-deploy\nDeploy to Dev\n(pre-merge)"]
+        REG["regression\nIntegration Tests"]
+        TAG["tag\nVersion tagging"]
+        PUB["publish\nPush image to registry"]
+        DEP["deploy\nDeploy to Dev"]
+        PRO_QA["promote → QA"]
+        PRO_STG["promote → Stage"]
+        PRO_PRD["promote → Prod"]
 
-Each directory contains a README file with specific instructions and explanations for the examples provided.
+        B --> T --> MR --> REG --> TAG --> PUB --> DEP --> PRO_QA --> PRO_STG --> PRO_PRD
+    end
+```
 
-## How to Use
+```mermaid
+flowchart LR
+    subgraph "Terraform Pipeline (tf-single-env-gitlab-ci.yml)"
+        TF_V["validate\nterraform validate"]
+        TF_P["plan\nterraform plan"]
+        TF_A["apply\nterraform apply\n(manual gate on prod)"]
 
-1. **Choose Your Provider:** Navigate to the folder corresponding to your Git hosting service.
-2. **Select a Pipeline:** Look through the examples provided and select one that closely matches your project's needs.
-3. **Customize:** Copy the example pipeline file into your repository and modify it as necessary to fit your project.
-4. **Commit and Push:** Commit the pipeline file to your repository to trigger the CI/CD process (you might need to configure your Git provider's CI/CD settings if it's your first time).
+        TF_V --> TF_P --> TF_A
+    end
+```
 
+## Available Pipelines
 
-## Disclaimer
+| File | Description |
+|------|-------------|
+| `multi-env-gitlab-ci.yml` | Full multi-stage pipeline: build, test, security scans, versioning, publish, and environment promotion (dev → QA → stage → prod) |
+| `tf-single-env-gitlab-ci.yml` | Terraform single-environment pipeline: validate, plan, and apply with manual gate |
+| `tf-complete-gitlab-ci.yml` | Complete Terraform workflow with multi-environment support and state management |
+| `multi-build-gitlab-ci.yml` | Parallel build pipeline for monorepos or multi-service deployments |
 
-These examples are provided "as is" without warranty of any kind, either express or implied. Always test your pipelines thoroughly in a staging environment before using them in production.
+## Key Features
 
-Thank you for visiting our repository, and we hope you find these examples helpful in your CI/CD journey!
+- **Docker-in-Docker** — container operations within CI jobs
+- **SonarCloud** — code quality analysis via shared pipeline library
+- **Security scanning** — SAST, dependency scanning, license scanning, and secret detection (GitLab built-in templates)
+- **Version and tag management** — automated versioning tied to branches and merge requests
+- **Environment promotion** — controlled progression from dev through production with manual approval gates
+- **Reusable includes** — shared pipeline library integration via `include:` blocks
+
+## Usage
+
+1. Copy the relevant `.yml` file to `.gitlab-ci.yml` in your repository
+2. Adjust variables at the top of the file (image, project key, service name, etc.)
+3. Configure required CI/CD variables in your GitLab project settings (AWS credentials, Sonar token, registry credentials)
+4. Commit and push to trigger the pipeline
